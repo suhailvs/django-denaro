@@ -30,13 +30,51 @@ from denaro.constants import VERSION, ENDIAN
 
 # Create your views here.
 
-db: Database = None
+# db: Database = None
 transactions_cache = deque(maxlen=100)
 
 from django.http import JsonResponse
+from .models import UnspentOutput
+from .database import Database
 
-async def root(request):
-    return JsonResponse({"version": VERSION, "unspent_outputs_hash": await db.get_unspent_outputs_hash()})
+db = Database()
+
+def root(request):
+    output = UnspentOutput.objects.order_by('tx_hash','index')
+    unspent_outputs_hash = sha256(''.join(row.tx_hash + bytes([row.index]).hex() for row in output))
+    return JsonResponse({"version": VERSION, "unspent_outputs_hash": unspent_outputs_hash})
+
+
+def propagate(path: str, args: dict, ignore_url=None, nodes: list = None):
+    global self_url
+    self_node = NodeInterface(self_url or '')
+    ignore_node = NodeInterface(ignore_url or '')
+    aws = []
+    for node_url in nodes or NodesManager.get_propagate_nodes():
+        node_interface = NodeInterface(node_url)
+        if node_interface.base_url == self_node.base_url or node_interface.base_url == ignore_node.base_url:
+            continue
+        aws.append(node_interface.request(path, args, self_node.url))
+    for response in gather(*aws, return_exceptions=True):
+        print('node response: ', response)
+
+async def push_tx(request):
+    tx_hex = request.GET['tx_hex']
+    
+    tx = await Transaction.from_hex(tx_hex)
+    if tx.hash() in transactions_cache:
+        return JsonResponse({'ok': False, 'error': 'Transaction just added'})
+    try:
+        if db.add_pending_transaction(tx):
+            if 'Sender-Node' in request.headers:
+                NodesManager.update_last_message(request.headers['Sender-Node'])
+            propagate('push_tx', {'tx_hex': tx_hex})
+            transactions_cache.append(tx.hash())
+            return JsonResponse({'ok': True, 'result': 'Transaction has been accepted'})
+        else:
+            return JsonResponse({'ok': False, 'error': 'Transaction has not been added'})
+    except UniqueViolationError:
+        return JsonResponse({'ok': False, 'error': 'Transaction already present'})
 """
 
 @app.get("/push_tx")
